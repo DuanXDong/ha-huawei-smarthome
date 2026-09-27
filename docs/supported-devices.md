@@ -121,10 +121,6 @@
 | `29UZ` | 九牧智能浴霸 | 九牧 | 浴霸 |
 | `A36L` | 科沃斯扫地机器人 | 科沃斯 | 扫地机器人 |
 | `29XC` | 欧井智能除湿机OJ-501E | 浙江欧伦电气有限公司 | 除湿机 |
-
-## 维护规则
-
-新增单品时，在 `custom_components/huawei_smarthome/device_adapters/` 增加对应的 `prod_<prodId>.py`，并同步更新本表。重复 `prodId` 不应新增第二个适配器文件。
 | `153E` | 领普三键墙壁开关 Q3D-HW-W3 | 领普科技 | 智能开关面板 |
 | `170W` | 720全效空气净化器 KJ400F-C400 | 720 | 空气净化器 |
 | `20GX` | 领普单键零火墙壁开关 Q3D-HW-W1 | 领普科技 | 智能开关面板 |
@@ -136,3 +132,7 @@
 | `2BMO` | 海雀智能门铃 DB001 | 海雀 | 智能门铃 |
 | `V0CE` | 华为智慧屏 V75 Pro (FREU-570A) | 华为 | 智慧屏 |
 | `X0A0` | 华为AI音箱 FLMG-10 | 华为 | 智能音箱 |
+
+## 维护规则
+
+新增单品时，在 `custom_components/huawei_smarthome/device_adapters/` 增加对应的 `prod_<prodId>.py`，并同步更新本表。重复 `prodId` 不应新增第二个适配器文件。

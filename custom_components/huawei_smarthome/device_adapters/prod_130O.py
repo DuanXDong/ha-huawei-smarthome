@@ -3,23 +3,24 @@
 设备类型: 热水器
 本适配器暴露:
    1. water_heater 热水器(switch.on / temperature.target / mode.mode)
-   2. binary_sensor 燃烧状态(burningStatus.on)
-   3. binary_sensor 循环状态(loopStatus.on)
-   4. binary_sensor 燃气安全状态(gasSafeStatus.status)
-   5. binary_sensor 整机安全状态(machineSafeStatus.status)
-   6. select 零冷水模式(noColdWaterMode.mode 1=夏季,2=冬季)
-   7. switch 零冷水开关(noColdWater.on)
-   8. switch 增压模式(boost.on)
-   9. sensor 进水温度(temperature.inlet)
+   2. switch 电源开关(switch.on) 方便获取设备开关状态
+   3. binary_sensor 燃烧状态(burningStatus.on)
+   4. binary_sensor 循环状态(loopStatus.on)
+   5. binary_sensor 燃气安全状态(gasSafeStatus.status)
+   6. binary_sensor 整机安全状态(machineSafeStatus.status)
+   7. select 零冷水模式(noColdWaterMode.mode 1=夏季,2=冬季)
+   8. switch 零冷水开关(noColdWater.on)
+   9. switch 增压模式(boost.on)
+   10. sensor 进水温度(temperature.inlet)
 
-   13. binary_sensor 故障(faultCode.status)
-   14. sensor 故障码(faultCode.code 0~15)
+   11. binary_sensor 故障(faultCode.status)
+   12. sensor 故障码(faultCode.code 0~15)
 
    ##以下服务未出现在profile中,但在设备上有显示,可能是profile不完整
-   15. sensor 当前水流量 升/分钟(useInformation.waterFlow)
-   16. sensor 生产热水总量 吨(useInformation.hotWater)
-   17. sensor 累计工作时长 小时(useInformation.burningTime)
-   18. sensor 累计燃气消耗 立方米(useInformation.naturalGas)
+   13. sensor 当前水流量 升/分钟(useInformation.waterFlow)
+   14. sensor 生产热水总量 吨(useInformation.hotWater)
+   15. sensor 累计工作时长 小时(useInformation.burningTime)
+   16. sensor 累计燃气消耗 立方米(useInformation.naturalGas)
 
 
 以下服务暂不适配:
@@ -29,6 +30,8 @@
     没有测试
    3. netInfo 网络信息(netInfo.intensity/netInfo.RSSI/netInfo.SSID/netInfo.IP)
     实测没有信息
+   4. waterControl ?(waterControl.on)
+    没在profile中出现, 实测设备有反应, 但搞不清楚具体是什么功能, 故暂时移除
 
 """
 
@@ -82,6 +85,20 @@ def _number(value: Any) -> int | float | None:
         return None
     return int(number) if number.is_integer() else number
 
+def _as_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(round(float(value.strip())))
+        except (TypeError, ValueError):
+            return None
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
 
 def _bool(value: Any) -> bool | None:
     if isinstance(value, bool):
@@ -139,7 +156,8 @@ def _sensorEntitySpec(name: str, key: str, service: str, characteristic: str, me
         key=key,
         name=name,
         state=lambda device: {
-            "native_value": value_map.get(_number(device.value(service, characteristic))) if value_map else device.value(service, characteristic)
+            "native_value": value_map.get(_number(device.value(service, characteristic))) if value_map else device.value(service, characteristic),
+            "extra_state_attributes": { "state_info": device._state }
         },
         metadata=metadata,
         availability=availability,
@@ -159,7 +177,7 @@ def _water_heater_spec(context: DeviceContext) -> EntitySpec:
     }
     if context.has_service("temperature"):
         actions["set_temperature"] = lambda device, data: device.async_send_service(
-            "temperature", {"target": _number(data.get("temperature"))}
+            "temperature", {"target": _as_int(data.get("temperature"))}
         )
     if context.has_service("mode"):
 
@@ -179,7 +197,7 @@ def _water_heater_spec(context: DeviceContext) -> EntitySpec:
         actions["set_operation_mode"] = set_operation_mode
 
     def state(device: DeviceContext) -> Mapping[str, Any]:
-        mode = _number(device.value("mode", "mode"))
+        mode = _as_int(device.value("mode", "mode"))
         operation = next(
             (
                 label
@@ -221,6 +239,11 @@ class Product130OAdapter:
             return ()
 
         entities: list[EntitySpec] = [_water_heater_spec(context)]
+
+        if context.has_service("switch"):
+            entities.append(
+                _switchEntitySpec("电源", "power", "switch", "on")
+            )
 
         if context.has_service("burningStatus"):
             entities.append(
@@ -307,6 +330,7 @@ class Product130OAdapter:
                 )
             )
 
+        #状态实体，不随掉线失效
         if context.has_service("useInformation"):
             entities.append(
                 _numberSensorEntitySpec(
@@ -353,6 +377,14 @@ class Product130OAdapter:
                     metadata={"entity_category": "diagnostic"}
                 )
             )
+
+        # if context.has_service("waterControl"):
+        #     entities.append(
+        #         _switchEntitySpec(
+        #             "水控开关", "water_control", "waterControl", "on",
+        #             metadata={"entity_category": "config"}
+        #         )
+        #     )
 
         return tuple(entities)
 

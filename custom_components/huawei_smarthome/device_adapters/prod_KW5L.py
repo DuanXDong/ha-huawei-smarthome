@@ -24,8 +24,9 @@ Security decisions (why this adapter writes less than the Profile allows)
    vendor App exposes no remote unlock either.  A control that reports success
    without moving the bolt is worse than a missing control -- and on a door
    lock an *automated* unlock that silently succeeds is a physical-security
-   event.  The lock entity therefore registers explicit refusal actions:
-   pressing them raises a self-explanatory error and never publishes anything.
+   event.  This adapter therefore creates no ``lock`` entity at all: 门锁状态 /
+   门 / 反锁 report the state, and there is no control that can be pressed into
+   doing nothing.
 
 2. **No credential material in Home Assistant state.**  The Profile exposes
    ``ciphers`` (``cp`` = the verification value), ``faces``/``fingers``
@@ -55,15 +56,49 @@ Security decisions (why this adapter writes less than the Profile allows)
    can remotely weaken the lock's verification requirements.
 
 5. **Writes are limited to preferences that cannot weaken access.**  Only
-   ``alarmEventSetting`` (notification switches and delays) and
-   ``volumeSetting`` (volumes, night mode, ring) are writable.  ``messagePushSwitch``
+   ``alarmEventSetting`` (the low-battery reminder and the message-push window)
+   and ``volumeSetting`` (volumes, night mode, ring) are writable.  ``messagePushSwitch``
    is deliberately the *only* notification channel that stays read-only: it is
    the master switch, and silently disabling every lock alert from an
    automation platform is a monitoring regression rather than a convenience.
 
+Real-device findings
+--------------------
+The message-push window is exposed as the ``消息推送时间`` selector (全天 /
+自定义时间, Profile default 全天) plus two writable text entities for
+``startTime`` / ``endTime``.  The vendor App (华为智慧生活) shows the same three
+controls on one page -- an earlier version of this file exposed the window
+*without* the selector, which left it with no reachable caller and made the
+pair look inert; both halves are mapped together now.  The 夜间自动调低音量 window
+(``volumeSetting.startTime`` / ``endTime``) is mapped the same way, next to the
+switch it belongs to.
+
+Later App passes dropped everything the App has no counterpart for: the ``lock``
+entity (its 上锁/解锁 buttons could only ever raise), every writable alert
+switch (门未关 / 开锁 / 防撬 / 非法开锁 / 警戒模式 / 门外开门 / 低电量), both
+pending-window delays (门外/门内告警延时), 异常抓拍
+(``alarmEventSetting.takeSnapshotSwitch``), the 猫眼拍照 / 实时视频 / 微光全彩
+/ 畸变校正 switches (实时视频 is an action in the App rather than a lasting
+setting, so no switch can track it), 当前铃声 and all three volumes (铃声音量 /
+按键音量 / 语音音量), and the 拍摄间隔 / 通话有效期 / 检测距离 / 逗留多久开始录像 /
+录像最大时长 selects.  Do not re-add any of them from the Profile alone.
+
+逗留多久开始录像 (``stayDuration``) deserves its own note: the App offers
+立即录像 / 3 / 6 / 9 / 15 / 20 / 30 / 60 秒, which does not overlap this Profile's
+enumList (0..12 = 3..15 秒), so the option table could not be built from either
+source alone.  A temporary probe was added to read the device's raw values, but
+the entity was retired before that capture happened.  If it is ever restored,
+capture the raw values first -- do not map the App's order onto 0..7, because the
+Profile states 0 = 3 秒.
+
+The ``catEyeSetting`` window (``startTime`` / ``endTime``) stays unmapped: the
+App exposes no matching control for it, the Profile declares no value format,
+and ``prod_D0AM.py`` records the same-shaped ``maxLength: 8`` field reporting
+``"10001200"`` on real hardware with unconfirmed meaning.  Do not re-add it
+from the Profile alone.
+
 What is exposed
 ---------------
-    lock                门锁                     (read-only, explicit refusal)
     sensor              门锁状态 / 网络状态 / 门锁告警 / 最近门锁告警
     sensor              门锁电池 / 猫眼电池 / 网络信号强度 / WiFi RSSI / IP 地址
     binary_sensor       门 / 反锁 / 门未关异常上锁 / 低电量告警
@@ -72,17 +107,14 @@ What is exposed
     sensor              开门方向 / 最近开门方式 / 最近门锁事件
     event               门锁事件 (unlock / lock / alarm / motion / doorbell /
                         arm / disarm / call / record)
-    switch              提醒开关: 门未关 / 开锁 / 防撬 / 非法开锁 / 警戒模式 /
-                        低电量 / 异常抓拍 / 门外开门 (消息推送总开关只读)
-    select              门外告警延时 / 门内告警延时
-    number x3           铃声音量 / 按键音量 / 语音音量
-    switch              夜间模式 / 实时视频 / 逗留抓拍 / 畸变校正 / 猫眼拍照 /
-                        微光全彩
-    select              逗留检测时长 / 拍摄间隔 / 拍摄时长 / 通话有效期 /
-                        检测距离 / 当前铃声
+    binary_sensor       消息推送总开关 (只读)
+    select              消息推送时间
+    text                消息推送开始/结束时间 (消息推送时间为「自定义时间」时生效)
+    switch              夜间自动调低音量 / 逗留抓拍
+    text                夜间自动调低音量开始/结束时间 (该开关开启时生效;
+                        shares its prefix on purpose -- the device page sorts by name)
     binary_sensor       布防 / 人脸识别 / 感应开锁 / 双重验证 / 密码验证 /
                         锁定保护 (只读)
-    text                消息推送开始/结束时间 / 猫眼生效开始/结束时间
 """
 
 from __future__ import annotations
@@ -312,28 +344,20 @@ _SECONDS_PER_HOUR = 3600.0
 # about something, never whether the door opens.
 # =============================================================================
 
-_ALARM_SWITCHES: tuple[tuple[str, str], ...] = (
-    ("doorNotCLoseSwitch", "门未关提醒"),  # Profile spelling, typo included
-    ("unlockSwitch", "开锁提醒"),
-    ("lockBrokenSwitch", "防撬告警提醒"),
-    ("forceUnlockedSwitch", "非法开锁告警提醒"),
-    ("alertModeUnlockedSwitch", "警戒模式开锁提醒"),
-    ("lowBatterySwitch", "低电量提醒"),
-    ("takeSnapshotSwitch", "异常抓拍"),
-    ("doorOpenSwitch", "门外开门提醒"),
-)
+# Every writable alert switch (门未关 / 开锁 / 防撬 / 非法开锁 / 警戒模式 /
+# 门外开门 / 低电量 提醒) was dropped after the vendor-App comparison: the App has
+# no counterpart for any of them.  Only the read-only master switch is left.
 
 # Read-only on purpose: the master notification switch.  Turning every lock
 # alert off from an automation platform is a monitoring regression, so it is
 # exposed as a sensor instead of a control.
 _MESSAGE_PUSH_SWITCH = "messagePushSwitch"
 
+# Real-device App comparison: 实时视频 (an action in the App, not a lasting
+# setting, so the switch never stayed in sync) and 猫眼拍照 (not found in the
+# App) were removed.
 _CAT_EYE_SWITCHES: tuple[tuple[str, str], ...] = (
     ("staySnapshotSwitch", "逗留抓拍"),
-    ("liveVideoSwitch", "实时视频"),
-    ("distortionCorrectionSwitch", "畸变校正"),
-    ("takeSnapshotSwitch", "猫眼拍照"),
-    ("shimmerFullColorSwitch", "微光全彩"),
 )
 
 # Read-only on purpose: these decide which credentials the lock will accept.
@@ -346,29 +370,39 @@ _SECURITY_SWITCHES: tuple[tuple[str, str], ...] = (
     ("enableLockoutSwitch", "锁定保护"),
 )
 
-_VOLUME_FIELDS: tuple[tuple[str, str], ...] = (
-    ("ringVolume", "铃声音量"),
-    ("keyVolume", "按键音量"),
-    ("voiceVolume", "语音音量"),
-)
+# 铃声音量 / 按键音量 / 语音音量 were all dropped: the App has no matching
+# control for any of them, so nothing on ``volumeSetting`` is written except
+# night mode and its window.
 
 # Enum selects resolved from the Profile's own enumList, in Profile order.
+# Real-device App comparison: 门外/门内告警延时, 拍摄间隔, 通话有效期 and 检测距离
+# have no counterpart in the vendor App and were removed.  拍摄时长 is shown in
+# the App as 录像最大时长, so it is named that way here.
 _ENUM_SELECTS: tuple[tuple[str, str, str, str], ...] = (
-    (_ALARM_SETTING_SID, "outAlarmTime", "alarm_delay_out", "门外告警延时"),
-    (_ALARM_SETTING_SID, "inAlarmTime", "alarm_delay_in", "门内告警延时"),
-    (_CAT_EYE_SETTING_SID, "stayDuration", "stay_duration", "逗留检测时长"),
-    (_CAT_EYE_SETTING_SID, "shootingInterval", "shooting_interval", "拍摄间隔"),
-    (_CAT_EYE_SETTING_SID, "shootingDuration", "shooting_duration", "拍摄时长"),
-    (_CAT_EYE_SETTING_SID, "callValidPeriod", "call_valid_period", "通话有效期"),
-    (_CAT_EYE_SETTING_SID, "detectDistance", "detect_distance", "检测距离"),
+    (_ALARM_SETTING_SID, "messagePushTime", "push_time_mode", "消息推送时间"),
+    # 逗留多久开始录像 (``stayDuration``) and 录像最大时长
+    # (``shootingDuration``) were dropped: the App has no matching control for
+    # either, and ``stayDuration`` did not even agree with the App's value space
+    # (see the module docstring).
 )
 
-# Time windows (``startTime`` / ``endTime``, HH:MM:SS strings).
+# Time windows (``startTime`` / ``endTime``, plain strings forwarded verbatim --
+# no format is imposed here, because the Profile declares none).  Each pair only
+# matters while the control it belongs to is active: 消息推送时间 must read
+# 自定义时间 (Profile default 全天), and 夜间自动调低音量 must be on.  Both are on
+# the Controls board with those controls, not on Configuration.
+_TIME_WINDOW_MAX_LENGTH = 8  # declared by the alarm fields, assumed for the rest
 _TIME_WINDOWS: tuple[tuple[str, str, str, str], ...] = (
     (_ALARM_SETTING_SID, "startTime", "push_start_time", "消息推送开始时间"),
     (_ALARM_SETTING_SID, "endTime", "push_end_time", "消息推送结束时间"),
-    (_CAT_EYE_SETTING_SID, "startTime", "cateye_start_time", "猫眼生效开始时间"),
-    (_CAT_EYE_SETTING_SID, "endTime", "cateye_end_time", "猫眼生效结束时间"),
+    # These two MUST keep the same leading characters as the 夜间自动调低音量
+    # switch (``night_mode``): HA's device page groups by entity_category and
+    # then sorts alphabetically by name, and it offers no way for an
+    # integration to pin an order.  Sharing the prefix is what keeps the three
+    # controls adjacent on the Controls board -- shortening these names would
+    # scatter them (夜 U+591C sorts far from 调 U+8C03).
+    (_VOLUME_SETTING_SID, "startTime", "night_start_time", "夜间自动调低音量开始时间"),
+    (_VOLUME_SETTING_SID, "endTime", "night_end_time", "夜间自动调低音量结束时间"),
 )
 
 # Enrolled-credential rosters.  Only the entry count is reported: the objects
@@ -1194,22 +1228,6 @@ def _unlock_reader() -> Callable[[DeviceContext], Any]:
 # =============================================================================
 
 
-def _refusal_action(verb: str):
-    """Refuse a control this product does not actually support.
-
-    HA's lock entity always renders 上锁/解锁, so the actions exist to fail
-    loudly: pressing them raises a self-explanatory error instead of the
-    generic "adapter action is unavailable", and -- far more important --
-    instead of silently publishing a write the firmware acks and ignores.
-    """
-
-    async def refuse(context: DeviceContext, data: Mapping[str, Any]) -> None:
-        del context, data
-        raise ValueError(f"该门锁不支持远程{verb}，请直接在门锁上操作")
-
-    return refuse
-
-
 def _switch_spec(
     sid: str,
     characteristic: str,
@@ -1326,10 +1344,32 @@ def _text_spec(
         key=key,
         name=name,
         state=state,
-        metadata={"min": 0, "max": max_length, "entity_category": "config"},
+        # No entity_category on purpose: these time fields belong on the same
+        # board as the control that activates them (the 消息推送时间 selector,
+        # or 夜间自动调低音量).  Every other configurable entity in this adapter is
+        # uncategorised for the same reason.
+        metadata={"min": 0, "max": max_length},
         actions={"set_value": set_value},
         availability=_available,
     )
+
+
+def _time_window_specs(
+    profile: Mapping[str, Any],
+    sid: str,
+) -> list[EntitySpec]:
+    """Return the time-window text entities that belong to one service."""
+
+    specs: list[EntitySpec] = []
+    for window_sid, characteristic, key, name in _TIME_WINDOWS:
+        if window_sid != sid:
+            continue
+        field = _field(profile, window_sid, characteristic)
+        if field is None:
+            continue
+        maximum = int(_number(field.get("maxLength")) or _TIME_WINDOW_MAX_LENGTH)
+        specs.append(_text_spec(window_sid, characteristic, key, name, maximum))
+    return specs
 
 
 def _battery_spec(
@@ -1379,26 +1419,6 @@ def _roster_spec(sid: str, name: str, key: str, label: str) -> EntitySpec:
     )
 
 
-def _ring_options(device: DeviceContext) -> tuple[tuple[str, int], ...]:
-    """Ringtones the lock advertises.
-
-    ``supportedRing`` is an int in this Profile and the only hint available,
-    so it is read as "this many ring indexes exist" and the labels stay
-    generic.  The index space is not documented anywhere in the Profile, so no
-    name is invented for an individual ring.
-    """
-
-    supported = _number(device.value(_VOLUME_SETTING_SID, "supportedRing"))
-    if supported is None or supported <= 0:
-        return ()
-    count = int(supported)
-    if count > 64:
-        # A bitmask or a corrupt reading rather than a count: refuse to build
-        # an option list that size instead of guessing.
-        return ()
-    return tuple((f"铃声{index}", index) for index in range(count))
-
-
 # =============================================================================
 # Adapter
 # =============================================================================
@@ -1415,19 +1435,10 @@ class ProductKW5LAdapter:
             return ()
 
         read_status = _status_reader()
-        entities: list[EntitySpec] = [
-            EntitySpec(
-                platform="lock",
-                key="lock",
-                name="门锁",
-                state=lambda device: _lock_state(read_status(device)),
-                actions={
-                    "lock": _refusal_action("上锁"),
-                    "unlock": _refusal_action("开锁"),
-                },
-                availability=_available,
-            )
-        ]
+        # No ``lock`` entity: HA always renders 上锁/解锁 buttons on it, and this
+        # family refuses remote bolt commands (see the module docstring), so the
+        # pair could only ever raise.  门锁状态 / 门 / 反锁 below carry the state.
+        entities: list[EntitySpec] = []
         entities.extend(self._lock_status_entities(profile, read_status))
         entities.extend(self._battery_entities(context))
         entities.extend(self._network_entities(context))
@@ -1436,9 +1447,8 @@ class ProductKW5LAdapter:
         entities.extend(self._notification_entities(profile, context))
         entities.extend(self._cat_eye_entities(profile, context))
         entities.extend(self._security_entities(context))
-        entities.extend(self._volume_entities(context))
+        entities.extend(self._volume_entities(profile, context))
         entities.extend(self._roster_entities(context))
-        entities.extend(self._time_window_entities(profile))
         return tuple(entities)
 
     # -- lock state ---------------------------------------------------------
@@ -1937,17 +1947,9 @@ class ProductKW5LAdapter:
     ) -> list[EntitySpec]:
         if not context.has_service(_ALARM_SETTING_SID):
             return []
-        entities = [
-            _switch_spec(
-                _ALARM_SETTING_SID,
-                characteristic,
-                f"alarm_{characteristic}",
-                label,
-                writable=True,
-            )
-            for characteristic, label in _ALARM_SWITCHES
-            if _field(profile, _ALARM_SETTING_SID, characteristic) is not None
-        ]
+        # No writable alert switches remain -- the App comparison removed every
+        # one of them (see the module docstring).
+        entities: list[EntitySpec] = []
         if _field(profile, _ALARM_SETTING_SID, _MESSAGE_PUSH_SWITCH) is not None:
             entities.append(
                 _switch_spec(
@@ -1965,6 +1967,8 @@ class ProductKW5LAdapter:
             spec = _enum_select_spec(profile, sid, characteristic, key, name)
             if spec is not None:
                 entities.append(spec)
+        # 消息推送开始/结束时间, shown next to the 消息推送时间 selector.
+        entities.extend(_time_window_specs(profile, _ALARM_SETTING_SID))
         return entities
 
     # -- cat-eye settings ---------------------------------------------------
@@ -1988,12 +1992,9 @@ class ProductKW5LAdapter:
             if _field(profile, _CAT_EYE_SETTING_SID, characteristic) is not None
         ]
 
-        for sid, characteristic, key, name in _ENUM_SELECTS:
-            if sid != _CAT_EYE_SETTING_SID:
-                continue
-            spec = _enum_select_spec(profile, sid, characteristic, key, name)
-            if spec is not None:
-                entities.append(spec)
+        # No enum selects remain on this service: 逗留多久开始录像 and
+        # 录像最大时长 were both dropped, and with them the temporary probe
+        # that existed only to capture ``stayDuration``'s real values.
         return entities
 
     # -- security settings (read-only) --------------------------------------
@@ -2021,100 +2022,31 @@ class ProductKW5LAdapter:
 
     # -- volume and ring ----------------------------------------------------
 
-    def _volume_entities(self, context: DeviceContext) -> list[EntitySpec]:
+    def _volume_entities(
+        self,
+        profile: Mapping[str, Any],
+        context: DeviceContext,
+    ) -> list[EntitySpec]:
         if not context.has_service(_VOLUME_SETTING_SID):
             return []
 
-        def make_state(characteristic: str):
-            def state(device: DeviceContext) -> Mapping[str, Any]:
-                return {
-                    "native_value": _number(
-                        device.value(_VOLUME_SETTING_SID, characteristic)
-                    )
-                }
-
-            return state
-
-        def make_action(characteristic: str):
-            async def action(device: DeviceContext, data: Mapping[str, Any]) -> None:
-                value = data.get("value")
-                if value is None:
-                    raise ValueError(f"{characteristic} requires a value")
-                number = _number(value)
-                if number is None or not 0 <= number <= 100:
-                    raise ValueError(f"{characteristic} accepts 0..100")
-                await device.async_send_service(
-                    _VOLUME_SETTING_SID, {characteristic: int(number)}
-                )
-
-            return action
-
-        entities = [
-            EntitySpec(
-                platform="number",
-                key=f"volume_{characteristic}",
-                name=label,
-                state=make_state(characteristic),
-                metadata={
-                    "min": 0,
-                    "max": 100,
-                    "step": 1,
-                    "unit": "%",
-                    "icon": "mdi:volume-high",
-                },
-                actions={"set_value": make_action(characteristic)},
-                availability=_available,
-            )
-            for characteristic, label in _VOLUME_FIELDS
-        ]
-
-        entities.append(
+        # 铃声音量 / 按键音量 / 语音音量, and 当前铃声 before them, were all
+        # dropped: the App has no matching control for any of them.  Only night
+        # mode and its window are written on this service now.
+        entities: list[EntitySpec] = [
             _switch_spec(
                 _VOLUME_SETTING_SID,
                 "nightModeSwitch",
                 "night_mode",
-                "夜间模式",
+                "夜间自动调低音量",
                 writable=True,
             )
-        )
+        ]
 
-        def ring_state(device: DeviceContext) -> Mapping[str, Any]:
-            options = _ring_options(device)
-            value = _number(device.value(_VOLUME_SETTING_SID, "currentRing"))
-            if value is None:
-                return {"current_option": None}
-            for label, index in options:
-                if index == value:
-                    return {"current_option": label}
-            # The reported ring is not one this device advertises: report
-            # unknown rather than a label that may name the wrong ring.
-            return {"current_option": None}
-
-        async def select_ring(device: DeviceContext, data: Mapping[str, Any]) -> None:
-            option = data.get("option")
-            for label, index in _ring_options(device):
-                if label == option:
-                    await device.async_send_service(
-                        _VOLUME_SETTING_SID, {"currentRing": index}
-                    )
-                    return
-            raise ValueError(f"unknown ring option: {option!r}")
-
-        # ``supportedRing`` is only known after the first state push, so the
-        # option list is resolved when the entity is read instead of at setup.
-        entities.append(
-            EntitySpec(
-                platform="select",
-                key="current_ring",
-                name="当前铃声",
-                state=ring_state,
-                metadata={
-                    "options": [label for label, _ in _ring_options(context)],
-                },
-                actions={"select_option": select_ring},
-                availability=_available,
-            )
-        )
+        # 夜间自动调低音量开始/结束时间.  The App presents these as part of the
+        # night mode feature; they only apply while that switch is on, and the
+        # shared name prefix is what sorts them next to it (see _TIME_WINDOWS).
+        entities.extend(_time_window_specs(profile, _VOLUME_SETTING_SID))
         return entities
 
     # -- rosters (counts only) ----------------------------------------------
@@ -2126,42 +2058,9 @@ class ProductKW5LAdapter:
             if context.has_service(sid)
         ]
 
-    # -- message-push / cat-eye time windows --------------------------------
-
-    def _time_window_entities(
-        self,
-        profile: Mapping[str, Any],
-    ) -> list[EntitySpec]:
-        entities: list[EntitySpec] = []
-        for sid, characteristic, key, name in _TIME_WINDOWS:
-            field = _field(profile, sid, characteristic)
-            if field is None:
-                continue
-            maximum = _number(field.get("maxLength")) or 8
-            entities.append(
-                _text_spec(sid, characteristic, key, name, int(maximum))
-            )
-        return entities
-
 
 def _string_value(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
-
-
-def _lock_state(status: Any) -> Mapping[str, Any]:
-    """Map one lockStatus value onto HA's lock states.
-
-    ``1`` (门未关异常上锁) reports the bolt as driven together with a door
-    anomaly, so the lock reads as locked and the dedicated
-    门未关异常上锁 binary sensor carries the anomaly (see the note on
-    ``_STATUS_BOLT_LOCKED``).
-    """
-
-    if status in _STATUS_BOLT_LOCKED:
-        return {"is_locked": True}
-    if status in _STATUS_BOLT_UNLOCKED:
-        return {"is_locked": False}
-    return {"is_locked": None}
 
 
 ADAPTER = ProductKW5LAdapter()

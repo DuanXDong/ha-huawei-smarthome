@@ -55,12 +55,13 @@ Security decisions (why this adapter writes less than the Profile allows)
    visible in HA (and usable in automations as conditions), but nothing here
    can remotely weaken the lock's verification requirements.
 
-5. **Writes are limited to preferences that cannot weaken access.**  Only
-   ``alarmEventSetting`` (the low-battery reminder and the message-push window)
-   and ``volumeSetting`` (volumes, night mode, ring) are writable.  ``messagePushSwitch``
-   is deliberately the *only* notification channel that stays read-only: it is
-   the master switch, and silently disabling every lock alert from an
-   automation platform is a monitoring regression rather than a convenience.
+5. **Writes are limited to preferences that cannot weaken access.**  After the
+   App comparison the writable set is exactly three things: the message-push
+   window on ``alarmEventSetting`` (``messagePushTime`` plus ``startTime`` /
+   ``endTime``), 逗留抓拍 on ``catEyeSetting``, and 夜间自动调低音量 with its
+   window on ``volumeSetting``.  ``messagePushSwitch`` is read-only: it is the
+   master switch, and silently disabling every lock alert from an automation
+   platform is a monitoring regression rather than a convenience.
 
 Real-device findings
 --------------------
@@ -113,7 +114,7 @@ What is exposed
     switch              夜间自动调低音量 / 逗留抓拍
     text                夜间自动调低音量开始/结束时间 (该开关开启时生效;
                         shares its prefix on purpose -- the device page sorts by name)
-    binary_sensor       布防 / 人脸识别 / 感应开锁 / 双重验证 / 密码验证 /
+    binary_sensor       布防模式 / 人脸识别 / 感应开锁 / 双重验证 / 密码验证 /
                         锁定保护 (只读)
 """
 
@@ -125,6 +126,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from ..domain.models import parse_remote_timestamp
 from .api import EntitySpec
 from .context import DeviceContext
 
@@ -149,7 +151,12 @@ _VOLUME_SETTING_SID = "volumeSetting"
 _EVENT_SID = "event"
 _EVENT_DATA_SID = "eventData"
 _EVENT_DATA_PAYLOAD_FIELD = "data"
-# This lock pushes a third per-event service that the Profile does not declare.
+# This lock pushes a third per-event service the Profile does not declare.  A live
+# capture shows it carrying {"eventType": 0|1, "event": N}: ``eventType`` is usable
+# (0 = opening, 1 = locking), while ``event`` is **not** -- its code space is
+# undocumented and does not share the Profile's ``userOperation`` numbering, so an
+# observed ``event: 6`` read as an operation code would be mislabelled 临时密码开门.
+# Only ``eventType`` is consulted, and only to refine a classification.
 _DOOR_EVENT_SID = "doorEvent"
 _DOOR_EVENT_TYPE_FIELD = "eventType"
 _DOOR_EVENT_TYPE_OPEN = 0
@@ -165,16 +172,16 @@ _USERS_SID = "users"
 # Enum spaces
 # =============================================================================
 
-# lockStatus/status.  The bolt position is only unambiguous for the statuses
-# whose names state it: 2 (已开锁) and 4 (已关门) retract/hold the bolt, while
-# 3 (已上锁) and 6 (已反锁) drive it.  1 (门未关异常上锁) names an anomaly
-# rather than a bolt position; it is grouped with the locked states, matching
-# every sibling lock adapter in this repository (KW02/KW38/KW4X/KW59), and is
-# additionally surfaced on its own 门未关异常上锁 binary sensor so the anomaly
+# lockStatus/status: every value the Profile declares -- 1 门未关异常上锁,
+# 2 已开锁, 3 已上锁, 4 已关门, 6 已反锁.  Anything else is a transitional reading
+# this firmware can emit (the KW02 family does).
+#
+# Bolt position is only unambiguous where the name states it: 2 and 4 retract or
+# hold the bolt, 3 and 6 drive it.  1 names an anomaly rather than a position --
+# like every sibling lock adapter (KW02/KW38/KW4X/KW59) it is read as
+# bolt-locked, and it also gets its own 门未关异常上锁 binary sensor so the anomaly
 # is never hidden behind the generic locked state.
-_STATUS_BOLT_LOCKED = frozenset({1, 3, 6})
-_STATUS_BOLT_UNLOCKED = frozenset({2, 4})
-_DECLARED_STATUSES = _STATUS_BOLT_LOCKED | _STATUS_BOLT_UNLOCKED
+_DECLARED_STATUSES = frozenset({1, 2, 3, 4, 6})
 
 _STATUS_DOOR_AJAR_LOCKED = 1
 _STATUS_DEADLOCK = 6
@@ -187,15 +194,14 @@ _DOOR_LEAF_CLOSED = frozenset({3, 4, 6})
 # networkConnectState/state: 0 = offline, 1 = sleeping, 2 = online.
 # A battery lock is asleep most of the time, so 休眠 must stay usable;
 # only an explicit 离线 marks the entities unavailable.
-_NET_STATE_OFFLINE = 0
+_NET_STATE_SLEEPING = 1
 _NET_STATE_ONLINE = 2
-_NET_AVAILABLE_STATES = frozenset({1, 2})
+_NET_AVAILABLE_STATES = frozenset({_NET_STATE_SLEEPING, _NET_STATE_ONLINE})
 
 # lockAlarm/alarm.  The Profile describes three conditions; the sibling
 # adapters observe that this service is never actually pushed (they read the
 # same concepts from batteryManager.lpmStatus and event.doorAlarmState), so it
 # is surfaced only when the device really does report it.
-_ALARM_FAULT = 1
 _ALARM_LOW_BATTERY = 2
 
 # low-battery detection bounds, shared with the sibling lock adapters.
@@ -251,6 +257,18 @@ _TIME_KEYS = ("eventTime", "et")
 #   type observed 0 on every record so far
 _RECORD_TYPE_KEYS = ("rt", "type")
 _IDENTIFIER_KEYS = ("eid", "aid", "id")
+
+# The fields echoed into the diagnostic attributes (the latched copy on
+# 最近门锁事件 and the raw record dump): operation, alarm, user, timestamp, record
+# type and identity tokens -- nothing else, so no credential can reach an attribute.
+_DIAGNOSTIC_KEYS = (
+    _OPERATION_KEYS
+    + _ALARM_KEYS
+    + _USER_KEYS
+    + _TIME_KEYS
+    + _RECORD_TYPE_KEYS
+    + ("uic", "eid", "aid")
+)
 
 # The cat-eye motion copy is the one record whose identity lives on ``aid``
 # (the sibling locks report ``up: 200`` with a MOTION_DETECTION token there),
@@ -340,22 +358,19 @@ _NO_ALARM_TEXT = "无告警"
 _SECONDS_PER_HOUR = 3600.0
 
 # =============================================================================
-# Notification switches.  Writable: these control whether the owner is told
-# about something, never whether the door opens.
+# Notifications.  What the owner is told about, never whether the door opens.
 # =============================================================================
 
-# Every writable alert switch (门未关 / 开锁 / 防撬 / 非法开锁 / 警戒模式 /
-# 门外开门 / 低电量 提醒) was dropped after the vendor-App comparison: the App has
-# no counterpart for any of them.  Only the read-only master switch is left.
+# Every writable alert switch was dropped by the App comparison, so the writable
+# part of this block is just the message-push window -- see the module docstring.
 
 # Read-only on purpose: the master notification switch.  Turning every lock
 # alert off from an automation platform is a monitoring regression, so it is
-# exposed as a sensor instead of a control.
+# exposed as a read-only binary sensor instead of a control.
 _MESSAGE_PUSH_SWITCH = "messagePushSwitch"
 
-# Real-device App comparison: 实时视频 (an action in the App, not a lasting
-# setting, so the switch never stayed in sync) and 猫眼拍照 (not found in the
-# App) were removed.
+# Only 逗留抓拍 is left: 实时视频 and 猫眼拍照 were dropped by the App comparison
+# (see the module docstring).
 _CAT_EYE_SWITCHES: tuple[tuple[str, str], ...] = (
     ("staySnapshotSwitch", "逗留抓拍"),
 )
@@ -370,28 +385,26 @@ _SECURITY_SWITCHES: tuple[tuple[str, str], ...] = (
     ("enableLockoutSwitch", "锁定保护"),
 )
 
-# 铃声音量 / 按键音量 / 语音音量 were all dropped: the App has no matching
-# control for any of them, so nothing on ``volumeSetting`` is written except
-# night mode and its window.
+# Nothing on ``volumeSetting`` is written except night mode and its window; the
+# three volumes and 当前铃声 were dropped by the App comparison.
 
-# Enum selects resolved from the Profile's own enumList, in Profile order.
-# Real-device App comparison: 门外/门内告警延时, 拍摄间隔, 通话有效期 and 检测距离
-# have no counterpart in the vendor App and were removed.  拍摄时长 is shown in
-# the App as 录像最大时长, so it is named that way here.
+# Enum selects resolved from the Profile's own enumList, in Profile order.  Only
+# the message-push selector survived the App comparison -- see the module
+# docstring for which ones were dropped and why.
 _ENUM_SELECTS: tuple[tuple[str, str, str, str], ...] = (
     (_ALARM_SETTING_SID, "messagePushTime", "push_time_mode", "消息推送时间"),
-    # 逗留多久开始录像 (``stayDuration``) and 录像最大时长
-    # (``shootingDuration``) were dropped: the App has no matching control for
-    # either, and ``stayDuration`` did not even agree with the App's value space
-    # (see the module docstring).
 )
+
+# Used only when the Profile declares no maxLength -- the alarm fields declare 8,
+# the volume fields declare nothing, and inventing a ceiling for those would
+# reject values the device may well accept.  text.py clamps to 255 regardless.
+_TEXT_MAX_LENGTH = 255
 
 # Time windows (``startTime`` / ``endTime``, plain strings forwarded verbatim --
 # no format is imposed here, because the Profile declares none).  Each pair only
 # matters while the control it belongs to is active: 消息推送时间 must read
 # 自定义时间 (Profile default 全天), and 夜间自动调低音量 must be on.  Both are on
 # the Controls board with those controls, not on Configuration.
-_TIME_WINDOW_MAX_LENGTH = 8  # declared by the alarm fields, assumed for the rest
 _TIME_WINDOWS: tuple[tuple[str, str, str, str], ...] = (
     (_ALARM_SETTING_SID, "startTime", "push_start_time", "消息推送开始时间"),
     (_ALARM_SETTING_SID, "endTime", "push_end_time", "消息推送结束时间"),
@@ -454,6 +467,24 @@ def _field(
         if isinstance(field, Mapping) and field.get("characteristicName") == name:
             return field
     return None
+
+
+def _require_writable(
+    profile: Mapping[str, Any] | None,
+    sid: str,
+    characteristic: str,
+) -> None:
+    """Refuse a write the Profile does not mark writable.
+
+    Controls are built only when their characteristic exists, but nothing checked
+    the *permission* before publishing: a Profile revision that made one of them
+    read-only would still be written to, and the cloud would reject it.
+    ``prod_ZG0F.py`` validates writes against the Profile schema the same way.
+    """
+
+    field = _field(profile or {}, sid, characteristic) or {}
+    if "W" not in str(field.get("method", "")):
+        raise ValueError(f"{sid}/{characteristic} is not writable in the Profile")
 
 
 def _number(value: Any) -> int | float | None:
@@ -553,17 +584,28 @@ def _first(record: Mapping[str, Any], keys: tuple[str, ...]) -> Any:
 
 
 def _parse_stamp(value: Any) -> datetime | None:
-    """Parse a SmartHome stamp such as ``20260915T232350Z``."""
+    """Parse a SmartHome stamp such as ``20260915T232350Z``.
+
+    Delegates to the shared :func:`parse_remote_timestamp` (the idiom in
+    KW02/KW38/KW4X/KW59), which truncates the nanosecond fractions the old local
+    parser rejected outright -- reporting a real timestamp as missing.  The
+    dashed ISO shape stays as a fallback because the local parser accepted it.
+    """
 
     if not isinstance(value, str) or not value.strip():
         return None
+    # Strip first: parse_remote_timestamp checks the raw string's trailing "Z", so
+    # a padded value would otherwise fall through to the ISO shape and fail.
     text = value.strip()
-    for shape in ("%Y%m%dT%H%M%SZ", "%Y%m%dT%H%M%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
-        try:
-            return datetime.strptime(text, shape).replace(tzinfo=timezone.utc)
-        except ValueError:
-            continue
-    return None
+    parsed = parse_remote_timestamp(text)
+    if parsed is not None:
+        return parsed
+    try:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return None
 
 
 def _format_stamp(value: Any) -> str | None:
@@ -638,6 +680,39 @@ def _available(device: DeviceContext) -> bool:
 
 
 # =============================================================================
+# Per-device adapter state
+# =============================================================================
+
+
+def _device_state(
+    context: DeviceContext,
+    name: str,
+    factory: Callable[[], Any],
+) -> Any:
+    """Return this device's copy of one adapter-private object, built once.
+
+    ``entity_specs`` is a plain property, not a cache, and setup is forwarded to
+    every entry in ``const.PLATFORMS`` (16 of them) -- so ``entities()`` runs
+    once per platform.  Specs may be rebuilt freely; these two objects may not:
+
+    * the latched event record, which 门锁事件 writes and 最近门锁事件 -- built by
+      a different platform -- reads back;
+    * the latched readers below, which would otherwise register a fresh push
+      listener on every build.
+
+    Kept on the context (a plain class, no ``__slots__``) so it dies with the
+    device; the ``_kw5l_`` prefix keeps the name clear of the framework's.
+    """
+
+    key = f"_kw5l_{name}"
+    cached = getattr(context, key, None)
+    if cached is None:
+        cached = factory()
+        setattr(context, key, cached)
+    return cached
+
+
+# =============================================================================
 # Lock state readers
 # =============================================================================
 
@@ -645,10 +720,12 @@ def _available(device: DeviceContext) -> bool:
 def _status_reader() -> Callable[[DeviceContext], int | float | None]:
     """Return a reader that keeps the last *declared* lockStatus value.
 
-    ``lockStatus/status`` is what every state entity reads, and a firmware may
+    ``lockStatus/status`` is what every state entity reads, and the firmware can
     report a transitional value the Profile does not declare (the KW02 family
-    does).  Holding the last declared value keeps 门锁 / 门锁状态 / 门
-    describing the same moment instead of blanking all three out.
+    does).  Holding the last declared value keeps 门锁状态 / 门 / 反锁 /
+    门未关异常上锁 describing the same moment instead of blanking them out, and
+    ``_device_state`` makes all four share one latch -- they sit on two platforms
+    and would otherwise hold a separate copy each.
     """
 
     cache: dict[str, Any] = {"status": None}
@@ -789,18 +866,7 @@ def _note_last_event(
     # Latched separately from the current slots: the slot an event arrived in is
     # overwritten by the next operation (typically the auto-relock seconds
     # later), so reading them back later describes a *different* occurrence.
-    last.fields = {
-        key: record[key]
-        for key in (
-            _OPERATION_KEYS
-            + _ALARM_KEYS
-            + _USER_KEYS
-            + _TIME_KEYS
-            + _RECORD_TYPE_KEYS
-            + ("uic", "eid", "aid")
-        )
-        if key in record
-    }
+    last.fields = {key: record[key] for key in _DIAGNOSTIC_KEYS if key in record}
 
 
 def _slot_identifiers(slot: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -872,9 +938,9 @@ def _unlock_in_slot(slot: Mapping[str, Any]) -> tuple[Any, str | None] | None:
     """
 
     operation = _slot_operation(slot)
+    # No separate _UNKNOWN_BOOKKEEPING check: _looks_like_unlock already rejects
+    # every code in _KNOWN_NON_UNLOCK_OPERATIONS, of which that set is a subset.
     if operation is None or not _looks_like_unlock(operation):
-        return None
-    if operation in _UNKNOWN_BOOKKEEPING:
         return None
     return operation, _slot_timestamp(slot)
 
@@ -891,20 +957,6 @@ def _unlock_slots(device: DeviceContext) -> tuple[Mapping[str, Any], ...]:
             ),
         },
     )
-
-
-def _door_event_slot(device: DeviceContext) -> Mapping[str, Any]:
-    """Return the ``doorEvent`` record, if the lock pushes one.
-
-    A live capture shows this service carrying ``{"eventType": 0|1, "event": N}``.
-    ``eventType`` is usable (0 = an opening operation, 1 = a locking one) but
-    ``event`` is **not**: its code space is undocumented and does not share the
-    Profile's ``userOperation`` numbering -- an observed ``event: 6`` would be
-    mislabelled 临时密码开门 if it were read as an operation code.  Only
-    ``eventType`` is therefore consulted, and only to refine a classification.
-    """
-
-    return device.service_state(_DOOR_EVENT_SID)
 
 
 def _unlock_is_stale(device: DeviceContext, occurred_at: str | None) -> bool:
@@ -1171,7 +1223,7 @@ def _looks_like_unlock(operation: Any) -> bool:
     return True
 
 
-def _unlock_reader() -> Callable[[DeviceContext], Any]:
+def _unlock_reader(device: DeviceContext) -> Callable[[DeviceContext], Any]:
     """Return a reader that keeps the latest *unlock* the lock reported.
 
     The unlock is **latched**, because the slot it arrived in is overwritten by
@@ -1180,11 +1232,11 @@ def _unlock_reader() -> Callable[[DeviceContext], Any]:
     reader that only inspected the current slot lost the unlock entirely.
 
     The latch is refreshed both when it is read and when the device pushes
-    anything (:meth:`attach`), since a slot can be overwritten between two
-    reads -- the entity's own state listener is the cheapest trigger available.
-    It is retired when the door reports a state clearly later than the unlock
-    (minutes, not seconds -- this lock re-locks by itself right after
-    unlocking) or when the unlock itself is a day old.
+    anything -- the push listener is registered below, and runs once per device
+    because callers build the reader through ``_device_state``.  It is retired
+    when the door reports a state clearly later than the unlock (minutes, not
+    seconds -- this lock re-locks by itself right after unlocking) or when the
+    unlock itself is a day old.
     """
 
     cache: dict[str, Any] = {"operation": None, "at": None}
@@ -1214,12 +1266,9 @@ def _unlock_reader() -> Callable[[DeviceContext], Any]:
             return None
         return cache["operation"]
 
-    def attach(device: DeviceContext) -> None:
-        """Latch on every push, so a slot overwritten between reads is not lost."""
-
-        device.add_state_listener(lambda: refresh(device))
-
-    read.attach = attach  # type: ignore[attr-defined]
+    # Latch on every push, so a slot overwritten between reads is not lost.
+    # Safe to register here: _device_state builds this once per device.
+    device.add_state_listener(lambda: refresh(device))
     return read
 
 
@@ -1246,6 +1295,7 @@ def _switch_spec(
         def make_action(value: int):
             async def action(context: DeviceContext, data: Mapping[str, Any]) -> None:
                 del data
+                _require_writable(context.profile, sid, characteristic)
                 await context.async_send_service(sid, {characteristic: value})
 
             return action
@@ -1265,9 +1315,9 @@ def _switch_spec(
             availability=_available,
         )
 
-    if sid == _ALARM_SETTING_SID:
-        metadata["icon"] = "mdi:bell-alert"
-    elif sid == _CAT_EYE_SETTING_SID:
+    # Only the cat-eye branch is reachable: the sole alarmEventSetting caller is
+    # the read-only master switch, which returned above.
+    if sid == _CAT_EYE_SETTING_SID:
         metadata["icon"] = "mdi:camera"
 
     return EntitySpec(
@@ -1367,7 +1417,8 @@ def _time_window_specs(
         field = _field(profile, window_sid, characteristic)
         if field is None:
             continue
-        maximum = int(_number(field.get("maxLength")) or _TIME_WINDOW_MAX_LENGTH)
+        declared = _number(field.get("maxLength"))
+        maximum = int(declared) if declared else _TEXT_MAX_LENGTH
         specs.append(_text_spec(window_sid, characteristic, key, name, maximum))
     return specs
 
@@ -1434,7 +1485,7 @@ class ProductKW5LAdapter:
         if profile is None or not context.has_service(_LOCK_STATUS_SID):
             return ()
 
-        read_status = _status_reader()
+        read_status = _device_state(context, "status_reader", _status_reader)
         # No ``lock`` entity: HA always renders 上锁/解锁 buttons on it, and this
         # family refuses remote bolt commands (see the module docstring), so the
         # pair could only ever raise.  门锁状态 / 门 / 反锁 below carry the state.
@@ -1446,7 +1497,7 @@ class ProductKW5LAdapter:
         entities.extend(self._event_entities(profile, context))
         entities.extend(self._notification_entities(profile, context))
         entities.extend(self._cat_eye_entities(profile, context))
-        entities.extend(self._security_entities(context))
+        entities.extend(self._security_entities(profile, context))
         entities.extend(self._volume_entities(profile, context))
         entities.extend(self._roster_entities(context))
         return tuple(entities)
@@ -1729,12 +1780,11 @@ class ProductKW5LAdapter:
             context.has_service(_EVENT_SID) or context.has_service(_EVENT_DATA_SID)
         ):
             return []
-        read_unlock = _unlock_reader()
-        # Latch unlocks on every push: the slot holding an unlock is overwritten
-        # by the next operation (typically the automatic relock seconds later),
-        # so waiting for a sensor read can miss the unlock entirely.
-        read_unlock.attach(context)  # type: ignore[attr-defined]
-        last_event = _LastEvent()
+        # Shared across every platform's build -- see _device_state.
+        read_unlock = _device_state(
+            context, "unlock_reader", lambda: _unlock_reader(context)
+        )
+        last_event = _device_state(context, "last_event", _LastEvent)
         operation_field = _field(profile, _EVENT_SID, "userOperation") or {}
 
         def decoder(device, sid, data, timestamp):
@@ -1769,14 +1819,17 @@ class ProductKW5LAdapter:
             for slot in _unlock_slots(device):
                 found = _unlock_in_slot(slot) or found
             stamp = found[1] if found else None
+            # Read the latch once: each call re-scans both slots and re-parses
+            # their timestamps, and the sensor platform reads state() twice.
+            operation = read_unlock(device)
             return {
-                "native_value": _unlock_direction(read_unlock(device)),
+                "native_value": _unlock_direction(operation),
                 # The raw code is what identifies a model-specific operation: if
                 # this shows a number while native_value is None, the code is
                 # simply not in the tables yet.  ``unlock_slot`` shows what the
                 # current slot holds and whether it was judged too old.
                 "extra_state_attributes": {
-                    "raw_user_operation": read_unlock(device),
+                    "raw_user_operation": operation,
                     "unlock_slot": {
                         "operation": found[0] if found else None,
                         "occurred_at": stamp,
@@ -1818,17 +1871,9 @@ class ProductKW5LAdapter:
             parsed = _parse_payload(event_data.get(_EVENT_DATA_PAYLOAD_FIELD))
             event_data_flat = {**dict(event_data), **parsed}
             chosen_sid, chosen = _newest_event_slot(device)
-            interesting = (
-                _OPERATION_KEYS
-                + _ALARM_KEYS
-                + _USER_KEYS
-                + _TIME_KEYS
-                + _RECORD_TYPE_KEYS
-                + ("uic", "eid", "aid")
-            )
 
             def fields_of(slot: Mapping[str, Any]) -> dict[str, Any]:
-                return {key: slot[key] for key in interesting if key in slot}
+                return {key: slot[key] for key in _DIAGNOSTIC_KEYS if key in slot}
 
             # Each slot is reported on its own so the values can be attributed
             # to the transport that carried them -- echoing one merged view
@@ -1960,7 +2005,7 @@ class ProductKW5LAdapter:
                     writable=False,
                 )
             )
-        # Pending-window delays live on the same service as the switches.
+        # 消息推送时间 -- the selector that decides whether the window below applies.
         for sid, characteristic, key, name in _ENUM_SELECTS:
             if sid != _ALARM_SETTING_SID:
                 continue
@@ -1999,7 +2044,11 @@ class ProductKW5LAdapter:
 
     # -- security settings (read-only) --------------------------------------
 
-    def _security_entities(self, context: DeviceContext) -> list[EntitySpec]:
+    def _security_entities(
+        self,
+        profile: Mapping[str, Any],
+        context: DeviceContext,
+    ) -> list[EntitySpec]:
         """Report the admin-gated security switches without being able to set them.
 
         See decision 4 in the module docstring: writing ``securitySetting``
@@ -2018,6 +2067,7 @@ class ProductKW5LAdapter:
                 writable=False,
             )
             for characteristic, label in _SECURITY_SWITCHES
+            if _field(profile, _SECURITY_SETTING_SID, characteristic) is not None
         ]
 
     # -- volume and ring ----------------------------------------------------
@@ -2033,15 +2083,17 @@ class ProductKW5LAdapter:
         # 铃声音量 / 按键音量 / 语音音量, and 当前铃声 before them, were all
         # dropped: the App has no matching control for any of them.  Only night
         # mode and its window are written on this service now.
-        entities: list[EntitySpec] = [
-            _switch_spec(
-                _VOLUME_SETTING_SID,
-                "nightModeSwitch",
-                "night_mode",
-                "夜间自动调低音量",
-                writable=True,
+        entities: list[EntitySpec] = []
+        if _field(profile, _VOLUME_SETTING_SID, "nightModeSwitch") is not None:
+            entities.append(
+                _switch_spec(
+                    _VOLUME_SETTING_SID,
+                    "nightModeSwitch",
+                    "night_mode",
+                    "夜间自动调低音量",
+                    writable=True,
+                )
             )
-        ]
 
         # 夜间自动调低音量开始/结束时间.  The App presents these as part of the
         # night mode feature; they only apply while that switch is on, and the

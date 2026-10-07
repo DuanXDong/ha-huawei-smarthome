@@ -21,7 +21,7 @@ Profile（profiles/X0A0.json）:
 本地扩展（依据真机 service_states 实报字段, 官方 Profile 未声明）:
 - media_player 增加 media_title：读 audioplayer.metadata（只读, 空串不显示）。
 - media_player 增加音量：volume_level = smartspeaker.volume/100,
-  set_volume 写 {smartspeaker: {volume: 0-100}}(官方插件同款命令)。
+  set_volume 写 {smartspeaker: {volume: 0-100}}(官方插件同款命令, 已真机验证)。
 - switch 蓝牙开关      smartspeaker.btSwitch   0/1
 - switch DLNA 投播     smartspeaker.dlnaSwitch 0/1
 - switch 音乐律动灯    musicLed.enable   0/1

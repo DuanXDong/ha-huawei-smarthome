@@ -10,7 +10,7 @@ CDN Profile 声明 switch/switch1..switch3 共 4 路, 但真机运行时状态
 实报还包含 switch4 (推测为 USB 口控制), 共 5 路。
 
 本适配器按设备实际存在的服务动态生成 HA ``switch``, 不写死路数。
-依据公开 Profile 与真机状态编写, 开关命令沿用统一格式, 请在 HA 中实测确认。
+开关命令沿用统一格式, 已在真实设备（总开关 + 4 分路, 共 5 路）实测验证。
 """
 
 from __future__ import annotations

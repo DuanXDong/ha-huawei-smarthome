@@ -13,7 +13,7 @@
 本适配器暴露 1 个 HA ``light`` (亮度+色温) + 1 个灯光模式 ``select``。
 timer/delay/name 特征不投影。
 
-开关/亮度经真实设备验证; 色温写命令未经真机验证, 请实测确认。
+开关、亮度、色温写命令均已在真实设备上验证。
 """
 
 from __future__ import annotations
